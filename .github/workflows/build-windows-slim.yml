@@ -1,0 +1,133 @@
+name: Build Windows Slim (External GTX 1060 Backend)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-slim:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build lightweight Rust sidecar launchers
+        shell: pwsh
+        run: |
+          $platform = (rustc --print host-tuple).Trim()
+          New-Item -ItemType Directory -Force -Path "tauri/src-tauri/binaries" | Out-Null
+
+          $serverRs = @'
+          use std::env;
+          use std::os::windows::process::CommandExt;
+          use std::process::{Command, exit};
+
+          const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+          fn main() {
+              let python = env::var("VOICEBOX_PYTHON")
+                  .unwrap_or_else(|_| r"D:\AI\chatterbox\.venv\Scripts\python.exe".to_string());
+              let backend_root = env::var("VOICEBOX_BACKEND_ROOT")
+                  .unwrap_or_else(|_| r"D:\AI\voicebox\src".to_string());
+              let hf_home = env::var("HF_HOME")
+                  .unwrap_or_else(|_| r"D:\AI\hf-cache".to_string());
+              let data_dir = env::var("VOICEBOX_DATA_DIR")
+                  .unwrap_or_else(|_| r"D:\AI\voicebox-data".to_string());
+
+              let raw_args: Vec<String> = env::args().skip(1).collect();
+              let mut args: Vec<String> = vec!["-m".to_string(), "backend.server".to_string()];
+              let mut i = 0;
+              let mut saw_data_dir = false;
+              while i < raw_args.len() {
+                  if raw_args[i] == "--data-dir" && i + 1 < raw_args.len() {
+                      args.push("--data-dir".to_string());
+                      args.push(data_dir.clone());
+                      saw_data_dir = true;
+                      i += 2;
+                  } else {
+                      args.push(raw_args[i].clone());
+                      i += 1;
+                  }
+              }
+              if !saw_data_dir && !raw_args.iter().any(|a| a == "--version") {
+                  args.push("--data-dir".to_string());
+                  args.push(data_dir.clone());
+              }
+
+              let mut cmd = Command::new(&python);
+              cmd.args(&args)
+                  .current_dir(&backend_root)
+                  .env("PYTHONPATH", &backend_root)
+                  .env("HF_HOME", &hf_home)
+                  .env("VOICEBOX_DATA_DIR", &data_dir)
+                  .env("VOICEBOX_BACKEND_VARIANT", "cuda")
+                  .creation_flags(CREATE_NO_WINDOW);
+
+              match cmd.status() {
+                  Ok(status) => exit(status.code().unwrap_or(0)),
+                  Err(e) => {
+                      eprintln!("Failed to launch Python backend ({}): {}", python, e);
+                      exit(1);
+                  }
+              }
+          }
+          '@
+          Set-Content -Path "shim_server.rs" -Value $serverRs -Encoding UTF8
+          rustc -O shim_server.rs -o "tauri/src-tauri/binaries/voicebox-server-$platform.exe"
+
+          $mcpRs = @'
+          use std::env;
+          use std::process::{Command, exit};
+
+          fn main() {
+              let python = env::var("VOICEBOX_PYTHON")
+                  .unwrap_or_else(|_| r"D:\AI\chatterbox\.venv\Scripts\python.exe".to_string());
+              let backend_root = env::var("VOICEBOX_BACKEND_ROOT")
+                  .unwrap_or_else(|_| r"D:\AI\voicebox\src".to_string());
+              let mut args: Vec<String> = vec!["-m".to_string(), "backend.mcp_shim".to_string()];
+              args.extend(env::args().skip(1));
+              match Command::new(&python).args(&args).current_dir(&backend_root).env("PYTHONPATH", &backend_root).status() {
+                  Ok(s) => exit(s.code().unwrap_or(0)),
+                  Err(e) => { eprintln!("Failed to launch MCP shim: {}", e); exit(1); }
+              }
+          }
+          '@
+          Set-Content -Path "shim_mcp.rs" -Value $mcpRs -Encoding UTF8
+          rustc -O shim_mcp.rs -o "tauri/src-tauri/binaries/voicebox-mcp-$platform.exe"
+
+          Get-Item "tauri/src-tauri/binaries/*.exe" | Select-Object Name, Length
+
+      - name: Disable updater signing in tauri.conf.json for slim build
+        shell: pwsh
+        run: |
+          $p = "tauri/src-tauri/tauri.conf.json"
+          $cfg = Get-Content $p -Raw | ConvertFrom-Json
+          $cfg.bundle.createUpdaterArtifacts = $false
+          $cfg.plugins.updater.endpoints = @()
+          $cfg | ConvertTo-Json -Depth 20 | Set-Content -Path $p -Encoding UTF8
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      - name: Build Windows NSIS installer (UI-only slim)
+        working-directory: tauri
+        run: bun run tauri build --bundles nsis
+
+      - name: Package slim artifacts (installer + backend Python source)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "slim-out" | Out-Null
+          Copy-Item "tauri/src-tauri/target/release/bundle/nsis/*-setup.exe" "slim-out/"
+          Compress-Archive -Path "backend" -DestinationPath "slim-out/voicebox-backend.zip" -Force
+          Get-Item "slim-out/*" | Select-Object Name, @{N='MB';E={[math]::Round($_.Length/1MB,2)}}
+
+      - name: Upload slim Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: voicebox-windows-slim
+          path: slim-out/
+          retention-days: 7
